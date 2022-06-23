@@ -5,6 +5,7 @@ use std::{
 
 use anyhow::{bail, Context};
 use clap::Parser;
+use owo_colors::OwoColorize;
 use serde::Deserialize;
 use tokio::sync::mpsc;
 
@@ -70,16 +71,25 @@ async fn report_errors(
     }
 
     if errors.is_empty() {
-        println!("\nSUCCESS: {} checkouts", success);
+        println!(
+            "\n{}: {} checkouts",
+            "SUCCESS".bright_green(),
+            success.green()
+        );
         Ok(())
     } else {
-        println!("\nFAIL: {} checkouts, {} errors", success, errors.len());
-        println!("Reproducing errors here for your convenience\n");
+        println!(
+            "\n{}: {} checkouts, {} error(s)",
+            "FAIL".bright_red(),
+            success.green(),
+            errors.len().red()
+        );
+        println!("\nCommand failed due to the following error(s):\n");
         for error in errors {
             let mut error: &dyn std::error::Error = error.as_ref();
             println!("Error: {}", error);
             while let Some(source) = error.source() {
-                println!("Caused by: {}", source);
+                println!("  Caused by: {}", source);
                 error = source;
             }
         }
@@ -228,11 +238,10 @@ async fn checkout(
                 continue;
             }
             tracing::error!(%error_code, %stderr, "could not update submodule");
-            bail!(
-                "Could not update submodule: error code {}\n\tError message: {}",
-                error_code,
-                stderr
-            )
+            return Err(anyhow::anyhow!(stderr.into_owned()).context(format!(
+                "Could not update submodule: error code {}",
+                error_code
+            )));
         }
     }
 }

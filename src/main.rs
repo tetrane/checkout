@@ -132,24 +132,7 @@ fn handle_repository<'a>(
         let config = if let Some(config) = config {
             config
         } else {
-            let component = if let Ok(component) =
-                path.strip_prefix("/home/tetrane/Documents/snoopy/git/octopus_checkout_rs/")
-            {
-                tracing::trace!("component {}", component.display());
-                component
-            } else {
-                tracing::trace!("prefix not found in path {}", path.display());
-                return Ok(());
-            };
-            let octopus_path = PathBuf::from("/home/tetrane/dev/octopus").join(component);
-            tracing::trace!("checking octopus_path {}", octopus_path.display());
-            let config = load_config(&octopus_path).context("Error reading configuration")?;
-            if let Some(config) = config {
-                tracing::trace!("Using config from octopus at '{}'", octopus_path.display());
-                config
-            } else {
-                return Ok(());
-            }
+            return Ok(());
         };
         tracing::trace!("Repo {} has a configuration", path.display());
 

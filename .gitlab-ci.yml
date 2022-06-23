@@ -1,4 +1,4 @@
-image: 
+image: "rust:1.61-buster"
 
 stages:
   - lintertest

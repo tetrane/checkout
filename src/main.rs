@@ -6,6 +6,7 @@ use std::{
 use anyhow::{bail, Context};
 use clap::Parser;
 use serde::Deserialize;
+use tokio::sync::mpsc;
 
 /// Checkouts all submodules recursively
 #[derive(Parser, Debug)]
@@ -31,7 +32,7 @@ const CONFIG_FILE: &str = "Checkout.toml";
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let tracer = tracing_subscriber::FmtSubscriber::builder()
-        .with_max_level(tracing::Level::TRACE)
+        .with_max_level(tracing::Level::INFO)
         .finish();
     tracing::subscriber::set_global_default(tracer)?;
     let args = Args::parse();
@@ -50,8 +51,40 @@ async fn main() -> anyhow::Result<()> {
                 root_repository.display()
             )
         })?;
-    handle_repository(root_repository, args.bump, args.ignore).await?;
-    Ok(())
+    let (error_sender, error_receiver) = mpsc::unbounded_channel();
+    handle_repository(root_repository, args.bump, args.ignore, error_sender).await?;
+    report_errors(error_receiver).await
+}
+
+async fn report_errors(
+    mut error_receiver: mpsc::UnboundedReceiver<anyhow::Result<()>>,
+) -> anyhow::Result<()> {
+    let mut success = 0;
+    let mut errors = Vec::new();
+
+    while let Some(result) = error_receiver.recv().await {
+        match result {
+            Ok(_) => success += 1,
+            Err(error) => errors.push(error),
+        }
+    }
+
+    if errors.is_empty() {
+        println!("\nSUCCESS: {} checkouts", success);
+        Ok(())
+    } else {
+        println!("\nFAIL: {} checkouts, {} errors", success, errors.len());
+        println!("Reproducing errors here for your convenience\n");
+        for error in errors {
+            let mut error: &dyn std::error::Error = error.as_ref();
+            println!("Error: {}", error);
+            while let Some(source) = error.source() {
+                println!("Caused by: {}", source);
+                error = source;
+            }
+        }
+        bail!("Command terminated with errors")
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -90,6 +123,7 @@ fn handle_repository<'a>(
     path: PathBuf,
     bumped_categories: Vec<String>,
     ignored_categories: Vec<String>,
+    error_sender: mpsc::UnboundedSender<anyhow::Result<()>>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + 'a + Send>> {
     Box::pin(async move {
         tracing::trace!("Handling repo {}", path.display());
@@ -134,20 +168,26 @@ fn handle_repository<'a>(
             let cloned_submodule_path = submodule_path.clone();
             let cloned_bumped_categories = bumped_categories.clone();
             let cloned_ignored_categories = ignored_categories.clone();
+            let cloned_error_sender = error_sender.clone();
             tasks.push(tokio::spawn(async move {
-                if let Err(error) =
-                    checkout(&cloned_path, &cloned_submodule_path, operation, recursive).await
-                {
+                let checkout_result =
+                    checkout(&cloned_path, &cloned_submodule_path, operation, recursive).await;
+                if let Err(error) = &checkout_result {
                     tracing::error!(?error)
                 } else if let Err(error) = handle_repository(
                     cloned_path.join(cloned_submodule_path),
                     cloned_bumped_categories,
                     cloned_ignored_categories,
+                    cloned_error_sender.clone(),
                 )
                 .await
                 {
-                    tracing::error!(?error)
+                    tracing::error!(?error);
+                    // ignore unexpectedly dropped receiver
+                    let _ = cloned_error_sender.send(Err(error));
                 }
+                // ignore unexpectedly dropped receiver
+                let _ = cloned_error_sender.send(checkout_result);
             }));
         }
 
@@ -171,38 +211,45 @@ async fn checkout(
     operation: Operation,
     recursive: bool,
 ) -> anyhow::Result<()> {
-    let mut update_cmd = tokio::process::Command::new("git");
-    update_cmd.args(["submodule", "update", "--init"]);
-    if matches!(operation, Operation::Bump) {
-        update_cmd.arg("--remote");
-    }
-    if recursive {
-        update_cmd.args(["--recursive"]);
-    }
-    update_cmd.arg("--").arg(&submodule_path).current_dir(&path);
-    let output = update_cmd.output().await.with_context(|| {
-        format!(
-            "Could not update submodule '{}' in '{}'",
-            submodule_path.display(),
-            path.display(),
-        )
-    })?;
-    if !output.status.success() {
-        let path = path.display();
-        let submodule_path = submodule_path.display();
-        let code = output
-            .status
-            .code()
-            .map(|x| x.to_string())
-            .unwrap_or_else(|| "?".into());
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        tracing::warn!(path = %path, submodule_path = %submodule_path, error_code = %code, %stderr,
-         "could not update submodule")
-    } else {
-        tracing::info!("{}", String::from_utf8_lossy(&output.stdout));
-    }
+    loop {
+        let mut update_cmd = tokio::process::Command::new("git");
+        update_cmd.args(["submodule", "update", "--init"]);
+        if matches!(operation, Operation::Bump) {
+            update_cmd.arg("--remote");
+        }
+        if recursive {
+            update_cmd.args(["--recursive"]);
+        }
+        update_cmd.arg("--").arg(&submodule_path).current_dir(&path);
+        let output = update_cmd.output().await.with_context(|| {
+            format!(
+                "Could not update submodule '{}' in '{}'",
+                submodule_path.display(),
+                path.display(),
+            )
+        })?;
+        if output.status.success() {
+            tracing::info!("Done checkouting {}", submodule_path.display());
 
-    tracing::trace!("Done checkouting {}", submodule_path.display());
-
-    Ok(())
+            return Ok(());
+        } else {
+            let error_code = output
+                .status
+                .code()
+                .map(|x| x.to_string())
+                .unwrap_or_else(|| "?".into());
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if stderr.contains("error: could not lock config file") {
+                tracing::warn!("git repository locked");
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                continue;
+            }
+            tracing::error!(%error_code, %stderr, "could not update submodule");
+            bail!(
+                "Could not update submodule: error code {}\n\tError message: {}",
+                error_code,
+                stderr
+            )
+        }
+    }
 }

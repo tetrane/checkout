@@ -130,12 +130,12 @@ fn load_config(path: &Path) -> anyhow::Result<Option<Config>> {
     }
 }
 
-fn handle_repository<'a>(
+fn handle_repository(
     path: PathBuf,
     bumped_categories: Vec<String>,
     ignored_categories: Vec<String>,
     error_sender: mpsc::UnboundedSender<anyhow::Result<()>>,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + 'a + Send>> {
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send>> {
     Box::pin(async move {
         tracing::trace!("Handling repo {}", path.display());
         let config = load_config(&path).context("Error reading configuration")?;

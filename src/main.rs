@@ -5,7 +5,6 @@ use std::{
 
 use anyhow::{bail, Context};
 use clap::Parser;
-use owo_colors::OwoColorize;
 use serde::Deserialize;
 use tokio::sync::mpsc;
 
@@ -60,6 +59,8 @@ async fn main() -> anyhow::Result<()> {
 async fn report_errors(
     mut error_receiver: mpsc::UnboundedReceiver<anyhow::Result<()>>,
 ) -> anyhow::Result<()> {
+    use owo_colors::OwoColorize;
+
     let mut success = 0;
     let mut errors = Vec::new();
 

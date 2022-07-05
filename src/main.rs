@@ -29,8 +29,15 @@ struct Args {
 
 const CONFIG_FILE: &str = "Checkout.toml";
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("Cannot spawn tokio runtime")?
+        .block_on(async_main())
+}
+
+async fn async_main() -> anyhow::Result<()> {
     let tracer = tracing_subscriber::FmtSubscriber::builder()
         .with_max_level(tracing::Level::INFO)
         .finish();
@@ -40,7 +47,7 @@ async fn main() -> anyhow::Result<()> {
     let root_repository = root_repository
         .canonicalize()
         .with_context(|| format!("Cannot resolve '{}'", root_repository.display()))?;
-    load_config(&root_repository)
+    let config = Config::load(&root_repository)
         .context(format!(
             "Error reading configuration in '{}'",
             root_repository.display()
@@ -52,37 +59,48 @@ async fn main() -> anyhow::Result<()> {
             )
         })?;
     let (error_sender, error_receiver) = mpsc::unbounded_channel();
-    handle_repository(root_repository, args.bump, args.ignore, error_sender).await?;
+    handle_repository(
+        root_repository,
+        args.bump,
+        args.ignore,
+        error_sender,
+        config,
+    )
+    .await?;
     report_errors(error_receiver).await
 }
 
 async fn report_errors(
-    mut error_receiver: mpsc::UnboundedReceiver<anyhow::Result<()>>,
+    mut error_receiver: mpsc::UnboundedReceiver<anyhow::Result<CheckoutResult>>,
 ) -> anyhow::Result<()> {
     use owo_colors::OwoColorize;
 
-    let mut success = 0;
+    let mut changed = 0;
+    let mut unchanged = 0;
     let mut errors = Vec::new();
 
     while let Some(result) = error_receiver.recv().await {
         match result {
-            Ok(_) => success += 1,
+            Ok(CheckoutResult::Changed) => changed += 1,
+            Ok(CheckoutResult::Unchanged) => unchanged += 1,
             Err(error) => errors.push(error),
         }
     }
 
     if errors.is_empty() {
         println!(
-            "\n{}: {} checkouts",
+            "\n{}: {} checkouts, {} unchanged",
             "SUCCESS".bright_green(),
-            success.green()
+            changed.green(),
+            unchanged.dimmed(),
         );
         Ok(())
     } else {
         println!(
-            "\n{}: {} checkouts, {} error(s)",
+            "\n{}: {} checkouts, {} unchanged, {} error(s)",
             "FAIL".bright_red(),
-            success.green(),
+            changed.green(),
+            unchanged.dimmed(),
             errors.len().red()
         );
         println!("\nCommand failed due to the following error(s):\n");
@@ -98,35 +116,79 @@ async fn report_errors(
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 struct Config {
     submodules: HashMap<PathBuf, Submodule>,
 }
 
-#[derive(Debug, Deserialize)]
+impl Config {
+    fn from_repository(
+        repository: git2::Repository,
+        categories: Vec<String>,
+    ) -> anyhow::Result<Self> {
+        let submodules = repository
+            .submodules()
+            .context("Could not load submodules")?
+            .into_iter()
+            .map(|submodule| {
+                (
+                    submodule.path().to_owned(),
+                    Submodule {
+                        categories: categories.clone(),
+                        recursive: Some(true),
+                        name: submodule.name().map(ToOwned::to_owned),
+                    },
+                )
+            })
+            .collect();
+        Ok(Self { submodules })
+    }
+
+    #[tracing::instrument(level = "trace")]
+    fn load(path: &Path) -> anyhow::Result<Option<Self>> {
+        let config_path: PathBuf = [path, Path::new(CONFIG_FILE)].iter().collect();
+        let config = std::fs::read_to_string(&config_path);
+        match config {
+            Ok(config) => {
+                let config = toml::from_str(&config).with_context(|| {
+                    format!(
+                        "Could not deserialize '{}' as a configuration object",
+                        config_path.display()
+                    )
+                })?;
+                Ok(Some(config))
+            }
+            Err(error) => match error.kind() {
+                std::io::ErrorKind::NotFound => Ok(None),
+                _ => bail!("Could not open '{}' as a toml file", config_path.display()),
+            },
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Clone)]
 struct Submodule {
     categories: Vec<String>,
     recursive: Option<bool>,
+    name: Option<String>,
 }
 
-#[tracing::instrument(level = "trace")]
-fn load_config(path: &Path) -> anyhow::Result<Option<Config>> {
-    let config_path: PathBuf = [path, Path::new(CONFIG_FILE)].iter().collect();
-    let config = std::fs::read_to_string(&config_path);
-    match config {
-        Ok(config) => {
-            let config = toml::from_str(&config).with_context(|| {
-                format!(
-                    "Could not deserialize '{}' as a configuration object",
-                    config_path.display()
-                )
-            })?;
-            Ok(Some(config))
+trait UnwrapOrResumeUnwind {
+    type T;
+    fn unwrap_or_resume_unwind(self) -> Self::T;
+}
+
+impl<T> UnwrapOrResumeUnwind for Result<T, tokio::task::JoinError> {
+    type T = T;
+
+    fn unwrap_or_resume_unwind(self) -> Self::T {
+        match self {
+            Ok(ok) => ok,
+            Err(err) => match err.try_into_panic() {
+                Ok(payload) => std::panic::resume_unwind(payload),
+                Err(_) => panic!("Task was unexpectedly cancelled"),
+            },
         }
-        Err(error) => match error.kind() {
-            std::io::ErrorKind::NotFound => Ok(None),
-            _ => bail!("Could not open '{}' as a toml file", config_path.display()),
-        },
     }
 }
 
@@ -134,18 +196,13 @@ fn handle_repository(
     path: PathBuf,
     bumped_categories: Vec<String>,
     ignored_categories: Vec<String>,
-    error_sender: mpsc::UnboundedSender<anyhow::Result<()>>,
+    error_sender: mpsc::UnboundedSender<anyhow::Result<CheckoutResult>>,
+    config: Config,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send>> {
     Box::pin(async move {
         tracing::trace!("Handling repo {}", path.display());
-        let config = load_config(&path).context("Error reading configuration")?;
+
         let mut tasks = Vec::new();
-        let config = if let Some(config) = config {
-            config
-        } else {
-            return Ok(());
-        };
-        tracing::trace!("Repo {} has a configuration", path.display());
 
         'submodules: for (submodule_path, submodule) in config.submodules {
             let mut operation = Operation::Checkout;
@@ -164,21 +221,65 @@ fn handle_repository(
             let cloned_ignored_categories = ignored_categories.clone();
             let cloned_error_sender = error_sender.clone();
             tasks.push(tokio::spawn(async move {
-                let checkout_result =
-                    checkout(&cloned_path, &cloned_submodule_path, operation, recursive).await;
+                let checkout_result = {
+                    let cloned_path = cloned_path.clone();
+                    let cloned_submodule_path = cloned_submodule_path.clone();
+
+                    tokio::task::spawn_blocking(move || {
+                        checkout_repo(
+                            cloned_path,
+                            cloned_submodule_path,
+                            operation,
+                            recursive,
+                            submodule.name,
+                        )
+                    })
+                    .await
+                    .unwrap_or_resume_unwind()
+                };
                 if let Err(error) = &checkout_result {
-                    tracing::error!(?error)
-                } else if let Err(error) = handle_repository(
-                    cloned_path.join(cloned_submodule_path),
-                    cloned_bumped_categories,
-                    cloned_ignored_categories,
-                    cloned_error_sender.clone(),
-                )
-                .await
-                {
-                    tracing::error!(?error);
-                    // ignore unexpectedly dropped receiver
-                    let _ = cloned_error_sender.send(Err(error));
+                    tracing::error!(
+                        ?error,
+                        ?cloned_path,
+                        ?cloned_submodule_path,
+                        "Error while checkouting repository"
+                    );
+                } else {
+                    let submodule_path = cloned_path.join(cloned_submodule_path);
+                    let config = if recursive {
+                        (|| {
+                            let repository = git2::Repository::open(&submodule_path)
+                                .context("Could not open submodule")?;
+                            Config::from_repository(repository, submodule.categories)
+                                .context("Could not load config")
+                                .map(Some)
+                        })()
+                    } else {
+                        Config::load(&submodule_path).context("Error reading configuration")
+                    };
+
+                    match config {
+                        Ok(Some(config)) => {
+                            if let Err(error) = handle_repository(
+                                submodule_path,
+                                cloned_bumped_categories,
+                                cloned_ignored_categories,
+                                cloned_error_sender.clone(),
+                                config,
+                            )
+                            .await
+                            {
+                                tracing::error!(?error, "Error while checkouting submodule");
+                                // ignore unexpectedly dropped receiver
+                                let _ = cloned_error_sender.send(Err(error));
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            // ignore unexpectedly dropped receiver
+                            let _ = cloned_error_sender.send(Err(error));
+                        }
+                    }
                 }
                 // ignore unexpectedly dropped receiver
                 let _ = cloned_error_sender.send(checkout_result);
@@ -186,7 +287,7 @@ fn handle_repository(
         }
 
         for task in tasks {
-            task.await.expect("Panicked in task");
+            task.await.unwrap_or_resume_unwind();
         }
         Ok(())
     })
@@ -198,51 +299,283 @@ enum Operation {
     Checkout,
 }
 
+fn retry_if_locked<T, F>(try_this: F) -> Result<T, git2::Error>
+where
+    F: FnMut() -> Result<T, git2::Error>,
+{
+    retry_if(
+        try_this,
+        |error| matches!(error.code(), git2::ErrorCode::Locked),
+        None,
+        Some(std::time::Duration::from_millis(100)),
+    )
+}
+
+fn retry_if<T, E, F, G>(
+    mut try_this: F,
+    mut continue_on: G,
+    retry_counts: Option<usize>,
+    try_interval: Option<std::time::Duration>,
+) -> Result<T, E>
+where
+    F: FnMut() -> Result<T, E>,
+    G: FnMut(&E) -> bool,
+{
+    match (try_this(), retry_counts) {
+        (Ok(t), _) => Ok(t),
+        (Err(error), None) => {
+            let mut error = error;
+
+            loop {
+                if !continue_on(&error) {
+                    return Err(error);
+                } else {
+                    if let Some(try_interval) = try_interval {
+                        std::thread::sleep(try_interval)
+                    }
+                    match try_this() {
+                        Ok(t) => return Ok(t),
+                        Err(new_error) => error = new_error,
+                    }
+                }
+            }
+        }
+        (Err(error), Some(retry_counts)) => {
+            let mut error = error;
+
+            for _ in 0..retry_counts {
+                if !continue_on(&error) {
+                    return Err(error);
+                } else {
+                    if let Some(try_interval) = try_interval {
+                        std::thread::sleep(try_interval)
+                    }
+                    match try_this() {
+                        Ok(t) => return Ok(t),
+                        Err(new_error) => error = new_error,
+                    }
+                }
+            }
+            Err(error)
+        }
+    }
+}
+
+pub enum CheckoutResult {
+    Changed,
+    Unchanged,
+}
+
 #[tracing::instrument]
-async fn checkout(
-    path: &Path,
-    submodule_path: &Path,
+fn checkout_repo(
+    path: PathBuf,
+    submodule_path: PathBuf,
     operation: Operation,
     recursive: bool,
-) -> anyhow::Result<()> {
-    loop {
-        let mut update_cmd = tokio::process::Command::new("git");
-        update_cmd.args(["submodule", "update", "--init"]);
-        if matches!(operation, Operation::Bump) {
-            update_cmd.arg("--remote");
-        }
-        if recursive {
-            update_cmd.args(["--recursive"]);
-        }
-        update_cmd.arg("--").arg(&submodule_path).current_dir(&path);
-        let output = update_cmd.output().await.with_context(|| {
-            format!(
-                "Could not update submodule '{}' in '{}'",
-                submodule_path.display(),
-                path.display(),
-            )
-        })?;
-        if output.status.success() {
-            tracing::info!("Done checkouting {}", submodule_path.display());
+    submodule_name: Option<String>,
+) -> anyhow::Result<CheckoutResult> {
+    let repository = git2::Repository::open(&path)
+        .with_context(|| format!("Could not open repository at path '{}'", path.display()))?;
 
-            return Ok(());
-        } else {
-            let error_code = output
-                .status
-                .code()
-                .map(|x| x.to_string())
-                .unwrap_or_else(|| "?".into());
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            if stderr.contains("error: could not lock config file") {
-                tracing::warn!("git repository locked");
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                continue;
-            }
-            tracing::error!(%error_code, %stderr, "could not update submodule");
-            return Err(anyhow::anyhow!(stderr.into_owned()).context(format!(
-                "Could not update submodule: error code {}",
-                error_code
-            )));
+    let submodule = submodule_name.as_deref().map(Ok).unwrap_or_else(|| {
+        submodule_path
+            .to_str()
+            .with_context(|| format!("Unsupported Non-UTF8 path '{}'", submodule_path.display()))
+    })?;
+
+    let mut submodule = repository
+        .find_submodule(submodule)
+        .context("Could not find submodule")?;
+
+    // TODO: "--force" mode that will pass true to overwrite parameter
+    retry_if_locked(|| submodule.init(false)).context("Could not init submodule")?;
+
+    // TODO: make optional
+    retry_if_locked(|| submodule.sync()).context("Could not sync submodule")?;
+    let branch = submodule.branch().map(ToOwned::to_owned);
+
+    let head_id = submodule.head_id().context("no head id for submodule")?;
+    let workdir_id = submodule.workdir_id();
+
+    tracing::trace!(%head_id, ?workdir_id);
+
+    // Attempt to open submodule, or creates it if it doesn't currently exist
+    let submodule = match submodule.open() {
+        Ok(submodule) => submodule,
+        Err(_) => {
+            let mut options = git2::SubmoduleUpdateOptions::new();
+            options.fetch(ssh_agent_fetch_options());
+            options.allow_fetch(false);
+
+            let fetch_result = retry_if(
+                || submodule.update(true, Some(&mut options)),
+                |error| {
+                    matches!(error.class(), git2::ErrorClass::Ssh)
+                        && !matches!(error.code(), git2::ErrorCode::Auth)
+                },
+                None,
+                Some(std::time::Duration::from_millis(100)),
+            );
+
+            let fetch_result = if let Err(error) = &fetch_result {
+                // ignore if the update failed due to missing commit: we'll try fetching it again later
+                if matches!(error.class(), git2::ErrorClass::Odb)
+                    && matches!(error.code(), git2::ErrorCode::NotFound)
+                {
+                    Ok(())
+                } else {
+                    fetch_result
+                }
+            } else {
+                fetch_result
+            };
+
+            fetch_result.context("Could not update submodule")?;
+
+            submodule.open().context("Could not open submodule")?
         }
+    };
+
+    // Determine target commit depending on operation
+    let target_id = match operation {
+        Operation::Checkout => head_id,
+        Operation::Bump => {
+            let branch = branch.unwrap_or_else(|| "HEAD".into());
+
+            let mut remote = submodule
+                .find_remote("origin")
+                .context("Could not find submodule remote")?;
+
+            retry_if(
+                || remote.fetch(&[&branch], Some(&mut ssh_agent_fetch_options()), None),
+                |error| {
+                    matches!(error.class(), git2::ErrorClass::Ssh)
+                        && !matches!(error.code(), git2::ErrorCode::Auth)
+                },
+                None,
+                Some(std::time::Duration::from_millis(100)),
+            )
+            .context("Could not fetch remote branch")?;
+            let branch = format!("refs/remotes/origin/{}", branch);
+
+            let reference = submodule.find_reference(&branch).context(format!(
+                "Could not find reference {branch} in submodule {}",
+                submodule_path.display()
+            ))?;
+
+            let commit = reference.peel_to_commit().context(format!(
+                "Could not get commit from reference {} in submodule {}",
+                branch,
+                submodule_path.display()
+            ))?;
+            commit.id()
+        }
+    };
+
+    if let Some(workdir_id) = workdir_id {
+        if workdir_id == target_id {
+            tracing::info!("HEAD already at {}", target_id);
+            let mut cb = git2::build::CheckoutBuilder::new();
+            cb.force();
+            submodule
+                .checkout_head(Some(&mut cb))
+                .context("Could not checkout head")?;
+
+            return Ok(CheckoutResult::Unchanged);
+        }
+    }
+
+    // optimistically attempt to set the commit
+    if submodule.set_head_detached(target_id).is_err() {
+        let mut remote = submodule
+            .find_remote("origin")
+            .context("Could not find submodule remote")?;
+
+        // optimistically fetches only requested commit
+        let fetch_result = retry_if(
+            || {
+                remote.fetch(
+                    &[format!("+{}:{}", target_id, target_id)],
+                    Some(&mut ssh_agent_fetch_options()),
+                    None,
+                )
+            },
+            |error| {
+                matches!(error.class(), git2::ErrorClass::Ssh)
+                    && !matches!(error.code(), git2::ErrorCode::Auth)
+            },
+            None,
+            Some(std::time::Duration::from_millis(100)),
+        );
+
+        // some servers don't allow fetching one commit; in that case fetch everything
+        let fetch_result = if let Err(error) = &fetch_result {
+            if matches!(error.class(), git2::ErrorClass::Odb)
+                && matches!(error.code(), git2::ErrorCode::NotFound)
+            {
+                retry_if(
+                    || remote.fetch::<&str>(&[], Some(&mut ssh_agent_fetch_options()), None),
+                    |error| {
+                        matches!(error.class(), git2::ErrorClass::Ssh)
+                            && !matches!(error.code(), git2::ErrorCode::Auth)
+                    },
+                    None,
+                    Some(std::time::Duration::from_millis(100)),
+                )
+            } else {
+                fetch_result
+            }
+        } else {
+            fetch_result
+        };
+
+        // if both fetches failed, then exit
+        fetch_result.context("Could not fetch submodule")?;
+
+        submodule
+            .set_head_detached(target_id)
+            .context("Could not set head in submodule")?;
+    }
+
+    tracing::info!("Updated HEAD from {:?} to {}", workdir_id, target_id);
+
+    let mut cb = git2::build::CheckoutBuilder::new();
+    cb.force();
+    submodule
+        .checkout_head(Some(&mut cb))
+        .context("Could not checkout head")?;
+
+    Ok(CheckoutResult::Changed)
+}
+
+fn ssh_agent_fetch_options() -> git2::FetchOptions<'static> {
+    let mut cbs = git2::RemoteCallbacks::new();
+    cbs.credentials(|_url, username_from_url, _allowed_types| {
+        if let Some(username_from_url) = username_from_url {
+            git2::Cred::ssh_key_from_agent(username_from_url)
+        } else {
+            Err(git2::Error::from_str(&format!(
+                "Unsupported authentication mode for {}",
+                _url
+            )))
+        }
+    });
+    cbs.certificate_check(|_cert, _s| {
+        tracing::warn!(%_s, "Ignoring certificate");
+        true
+    });
+    let mut fetch_opts = git2::FetchOptions::new();
+    fetch_opts.remote_callbacks(cbs);
+    fetch_opts
+}
+
+#[cfg(test)]
+mod test {
+    #[test]
+    fn libgit_correctly_compiled() {
+        let version = git2::Version::get();
+        assert!(version.https());
+        assert!(version.ssh());
+        assert!(version.threads());
     }
 }

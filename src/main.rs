@@ -9,22 +9,46 @@ use serde::Deserialize;
 use tokio::sync::mpsc;
 
 /// Checkouts all submodules recursively
+///
+/// Pass arguments on the command line, or via environment variables.
 #[derive(Parser, Debug)]
 #[clap(author, version, about, long_about = None)]
 struct Args {
     /// the passed categories of submodules will be bumped
     /// to their upstream rather than their current revision
+    ///
+    /// Environment variable: TETRANE_CHECKOUT_BUMP
     #[clap(short, long)]
     bump: Vec<String>,
 
     /// the passed categories of submodules will be ignored
     /// and not init'ed or checkout'd
+    ///
+    /// Environment variable: TETRANE_CHECKOUT_IGNORE
     #[clap(short, long)]
     ignore: Vec<String>,
 
     /// Path to the root repository containing a Checkout.toml (default: '.')
+    ///
+    /// Environment variable: TETRANE_CHECKOUT_REPOSITORY_PATH
     #[clap(value_parser)]
     repository_path: Option<String>,
+}
+
+impl Args {
+    fn merge_from_env(&mut self) {
+        if let Ok(bump) = std::env::var("TETRANE_CHECKOUT_BUMP") {
+            self.bump
+                .extend(bump.split_ascii_whitespace().map(ToOwned::to_owned))
+        }
+        if let Ok(ignore) = std::env::var("TETRANE_CHECKOUT_IGNORE") {
+            self.ignore
+                .extend(ignore.split_ascii_whitespace().map(ToOwned::to_owned))
+        }
+        if let Ok(repository_path) = std::env::var("TETRANE_CHECKOUT_REPOSITORY_PATH") {
+            self.repository_path = Some(repository_path)
+        }
+    }
 }
 
 const CONFIG_FILE: &str = "Checkout.toml";
@@ -42,7 +66,8 @@ async fn async_main() -> anyhow::Result<()> {
         .with_max_level(tracing::Level::INFO)
         .finish();
     tracing::subscriber::set_global_default(tracer)?;
-    let args = Args::parse();
+    let mut args = Args::parse();
+    args.merge_from_env();
     let root_repository = PathBuf::from(args.repository_path.unwrap_or_else(|| ".".into()));
     let root_repository = root_repository
         .canonicalize()

@@ -33,6 +33,14 @@ struct Args {
     /// Environment variable: TETRANE_CHECKOUT_REPOSITORY_PATH
     #[clap(value_parser)]
     repository_path: Option<String>,
+
+    /// If present, forces the checkout to occur even if there are modified files staged.
+    ///
+    /// **This can lead to data losses.**
+    ///
+    /// Environment variable: TETRANE_CHECKOUT_FORCE_CHECKOUT
+    #[clap(short, long, parse(from_flag))]
+    force_checkout: bool,
 }
 
 impl Args {
@@ -47,6 +55,10 @@ impl Args {
         }
         if let Ok(repository_path) = std::env::var("TETRANE_CHECKOUT_REPOSITORY_PATH") {
             self.repository_path = Some(repository_path)
+        }
+        if let Ok(force_checkout) = std::env::var("TETRANE_CHECKOUT_FORCE_CHECKOUT") {
+            self.force_checkout =
+                force_checkout != "0" && force_checkout.to_ascii_lowercase() != "false"
         }
     }
 }
@@ -90,6 +102,7 @@ async fn async_main() -> anyhow::Result<()> {
         args.ignore,
         error_sender,
         config,
+        args.force_checkout,
     )
     .await?;
     report_errors(error_receiver).await
@@ -223,6 +236,7 @@ fn handle_repository(
     ignored_categories: Vec<String>,
     error_sender: mpsc::UnboundedSender<anyhow::Result<CheckoutResult>>,
     config: Config,
+    force_checkout: bool,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send>> {
     Box::pin(async move {
         tracing::trace!("Handling repo {}", path.display());
@@ -255,7 +269,7 @@ fn handle_repository(
                             cloned_path,
                             cloned_submodule_path,
                             operation,
-                            recursive,
+                            force_checkout,
                             submodule.name,
                         )
                     })
@@ -291,6 +305,7 @@ fn handle_repository(
                                 cloned_ignored_categories,
                                 cloned_error_sender.clone(),
                                 config,
+                                force_checkout,
                             )
                             .await
                             {
@@ -396,7 +411,7 @@ fn checkout_repo(
     path: PathBuf,
     submodule_path: PathBuf,
     operation: Operation,
-    recursive: bool,
+    force_checkout: bool,
     submodule_name: Option<String>,
 ) -> anyhow::Result<CheckoutResult> {
     let repository = git2::Repository::open(&path)
@@ -565,7 +580,9 @@ fn checkout_repo(
     tracing::info!("Updated HEAD from {:?} to {}", workdir_id, target_id);
 
     let mut cb = git2::build::CheckoutBuilder::new();
-    cb.force();
+    if force_checkout {
+        cb.force();
+    }
     submodule
         .checkout_head(Some(&mut cb))
         .context("Could not checkout head")?;

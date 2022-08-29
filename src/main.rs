@@ -534,7 +534,9 @@ fn checkout_repo(
         if workdir_id == target_id {
             tracing::info!("HEAD already at {}", target_id);
             let mut cb = git2::build::CheckoutBuilder::new();
-            cb.force();
+            if force_checkout {
+                cb.force();
+            }
             submodule
                 .checkout_head(Some(&mut cb))
                 .context("Could not checkout head")?;

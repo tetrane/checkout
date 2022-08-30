@@ -445,7 +445,11 @@ fn checkout_repo(
         Err(_) => {
             // git init the submodule in .git/modules/<submodule_path> of the parent repository
             let mut init_opts = git2::RepositoryInitOptions::new();
-            init_opts.mkpath(true).no_reinit(false).no_dotgit_dir(true);
+            init_opts
+                .mkpath(true)
+                .mkdir(true)
+                .no_reinit(false)
+                .no_dotgit_dir(true);
             let workdir = repository
                 .workdir()
                 .context("Could not get parent workdir")?;

@@ -443,10 +443,23 @@ fn checkout_repo(
     let submodule = match submodule.open() {
         Ok(submodule) => submodule,
         Err(_) => {
+            // git init the submodule in .git/modules/<submodule_path> of the parent repository
+            let mut init_opts = git2::RepositoryInitOptions::new();
+            init_opts.mkpath(true).no_reinit(false).no_dotgit_dir(true);
+            let workdir = repository
+                .workdir()
+                .context("Could not get parent workdir")?;
+            init_opts.workdir_path(&workdir.join(&submodule_path));
+            let gitdir = repository
+                .path()
+                .join(Path::new("modules"))
+                .join(&submodule_path);
+            git2::Repository::init_opts(gitdir, &init_opts).context("Could not init submodule")?;
+
+            // update the submodule
             let mut options = git2::SubmoduleUpdateOptions::new();
             options.fetch(ssh_agent_fetch_options());
             options.allow_fetch(false);
-
             let fetch_result = retry_if(
                 || submodule.update(true, Some(&mut options)),
                 |error| {
@@ -471,6 +484,11 @@ fn checkout_repo(
             };
 
             fetch_result.context("Could not update submodule")?;
+
+            // Set the origin remote
+            retry_if_locked(|| submodule.sync())
+                .context("Could not sync submodule")
+                .unwrap();
 
             submodule.open().context("Could not open submodule")?
         }
@@ -516,7 +534,9 @@ fn checkout_repo(
         if workdir_id == target_id {
             tracing::info!("HEAD already at {}", target_id);
             let mut cb = git2::build::CheckoutBuilder::new();
-            cb.force();
+            if force_checkout {
+                cb.force();
+            }
             submodule
                 .checkout_head(Some(&mut cb))
                 .context("Could not checkout head")?;

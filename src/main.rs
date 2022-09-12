@@ -445,11 +445,7 @@ fn checkout_repo(
         Err(_) => {
             // git init the submodule in .git/modules/<submodule_path> of the parent repository
             let mut init_opts = git2::RepositoryInitOptions::new();
-            init_opts
-                .mkpath(true)
-                .mkdir(true)
-                .no_reinit(false)
-                .no_dotgit_dir(true);
+            init_opts.no_reinit(false).no_dotgit_dir(true);
             let workdir = repository
                 .workdir()
                 .context("Could not get parent workdir")?;
@@ -458,6 +454,7 @@ fn checkout_repo(
                 .path()
                 .join(Path::new("modules"))
                 .join(&submodule_path);
+            std::fs::create_dir_all(&gitdir).context("Could not create submodule path")?; // RepositoryInitOptions.mkpath() doesn't seem to work, let's help it
             git2::Repository::init_opts(gitdir, &init_opts).context("Could not init submodule")?;
 
             // update the submodule

@@ -34,12 +34,12 @@ struct Args {
     #[clap(value_parser)]
     repository_path: Option<String>,
 
-    /// If present, forces the checkout to occur even if there are modified files staged.
+    /// If present, forces the checkout to occur even if there are modified files (staged or not).
     ///
-    /// **This can lead to data losses.**
+    /// **Enabling this option can lead to data losses.**
     ///
     /// Environment variable: TETRANE_CHECKOUT_FORCE_CHECKOUT
-    #[clap(short, long, parse(from_flag))]
+    #[clap(long, parse(from_flag))]
     force_checkout: bool,
 }
 

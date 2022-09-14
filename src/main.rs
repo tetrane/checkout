@@ -693,6 +693,14 @@ fn checkout_repo(
         .set_head_detached(target_id)
         .context("Could not set head in submodule")?;
 
+    // set_head_detached tend to index stuff, clear everything (nothing was indexed before as per the status check)
+    let mut index = submodule
+        .index()
+        .context("Could not get submodule's index file")?;
+    let head_tree = submodule.head()?.peel_to_tree()?;
+    index.read_tree(&head_tree)?;
+    index.write()?;
+
     tracing::info!("Updated HEAD from {:?} to {}", workdir_id, target_id);
 
     checkout_head(&submodule)?;

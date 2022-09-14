@@ -613,13 +613,7 @@ fn checkout_repo(
     if let Some(workdir_id) = workdir_id {
         if workdir_id == target_id {
             tracing::info!("HEAD already at {}", target_id);
-            let mut cb = git2::build::CheckoutBuilder::new();
-            if force_checkout {
-                cb.force();
-            }
-            submodule
-                .checkout_head(Some(&mut cb))
-                .context("Could not checkout head")?;
+            checkout_head(&submodule)?;
 
             return Ok(CheckoutResult::Unchanged);
         }
@@ -679,15 +673,20 @@ fn checkout_repo(
 
     tracing::info!("Updated HEAD from {:?} to {}", workdir_id, target_id);
 
+    checkout_head(&submodule)?;
+
+    Ok(CheckoutResult::Changed)
+}
+
+fn checkout_head(repository: &git2::Repository) -> anyhow::Result<()> {
     let mut cb = git2::build::CheckoutBuilder::new();
-    if force_checkout {
-        cb.force();
-    }
-    submodule
+    cb.force();
+
+    repository
         .checkout_head(Some(&mut cb))
         .context("Could not checkout head")?;
 
-    Ok(CheckoutResult::Changed)
+    Ok(())
 }
 
 fn ssh_agent_fetch_options() -> git2::FetchOptions<'static> {

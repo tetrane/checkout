@@ -495,6 +495,85 @@ fn checkout_repo(
         }
     };
 
+    let mut untracked_files = Vec::new();
+
+    // check submodule's current status, fail if there are modified or staged files
+    if !force_checkout {
+        if !matches!(submodule.state(), git2::RepositoryState::Clean) {
+            bail!("The submodule is not in a clean state (is a rebase in progress?")
+        }
+        let mut status_options = git2::StatusOptions::default();
+        status_options.include_untracked(true);
+        let statuses = submodule
+            .statuses(Some(&mut status_options))
+            .context("Could not access submodule status")?;
+        if !statuses.is_empty() {
+            let statuses: Vec<_> = statuses
+                .iter()
+                .filter_map(|entry| {
+                    let path = entry.path()?;
+
+                    // We need to handle submodules specially, because we don't want to lose their contents if modified,
+                    // but at the same time we don't want to stop just because they are not at the right commit,
+                    // since it is kind of the point to checkout them :-).
+                    // This checks if the conflicting path is a submodule, and if so, it attempts to get its status.
+                    // If the submodule is not in the index of this repository, we can safely ignore it:
+                    // - the checkout operation ignores submodule.
+                    // - the "dirtiness" of the submodule's worktree will be detected afterwards as long as it has a
+                    //   Checkout.toml.
+                    if let Ok(status) =
+                        submodule.submodule_status(path, git2::SubmoduleIgnore::Untracked)
+                    {
+                        if !status.intersects(
+                            git2::SubmoduleStatus::INDEX_ADDED
+                                | git2::SubmoduleStatus::INDEX_DELETED
+                                | git2::SubmoduleStatus::INDEX_MODIFIED,
+                        ) {
+                            return None;
+                        }
+                        tracing::info!(?status)
+                    }
+
+                    let prefix = if entry.status().is_conflicted() {
+                        "CONFLICT: "
+                    } else if entry.status().is_index_deleted() {
+                        "Indexed for deletion: "
+                    } else if entry.status().is_index_modified() {
+                        "Indexed: "
+                    } else if entry.status().is_index_new() {
+                        "Indexed as new file: "
+                    } else if entry.status().is_index_renamed() {
+                        "Indexed for renaming: "
+                    } else if entry.status().is_index_typechange() {
+                        "Indexed for type change: "
+                    } else if entry.status().is_wt_deleted() {
+                        "Deleted in worktree: "
+                    } else if entry.status().is_wt_modified() {
+                        "Modified: "
+                    } else if entry.status().is_wt_new() {
+                        untracked_files.push(path.to_string());
+                        return None;
+                    } else if entry.status().is_wt_renamed() {
+                        "Renamed in worktree: "
+                    } else if entry.status().is_wt_typechange() {
+                        "Type changed in worktree: "
+                    } else {
+                        "UNKNOWN: "
+                    };
+                    Some(format!("{prefix}{}/{}", submodule_path.display(), path))
+                })
+                .collect();
+            if !statuses.is_empty() {
+                let unclean_files = statuses.join("\n- ");
+                bail!(format!(
+                    "Repository '{}' is not clean:\n- {}",
+                    submodule_path.display(),
+                    unclean_files
+                ));
+            }
+        }
+    }
+
     // Determine target commit depending on operation
     let target_id = match operation {
         Operation::Checkout => head_id,

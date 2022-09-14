@@ -612,7 +612,7 @@ fn checkout_repo(
 
     if let Some(workdir_id) = workdir_id {
         if workdir_id == target_id {
-            tracing::info!("HEAD already at {}", target_id);
+            tracing::trace!("HEAD already at {}", target_id);
             checkout_head(&submodule)?;
 
             return Ok(CheckoutResult::Unchanged);

@@ -620,56 +620,78 @@ fn checkout_repo(
     }
 
     // optimistically attempt to set the commit
-    if submodule.set_head_detached(target_id).is_err() {
-        let mut remote = submodule
-            .find_remote("origin")
-            .context("Could not find submodule remote")?;
+    let commit = match submodule.find_commit(target_id) {
+        Ok(commit) => commit,
+        Err(_) => {
+            let mut remote = submodule
+                .find_remote("origin")
+                .context("Could not find submodule remote")?;
 
-        // optimistically fetches only requested commit
-        let fetch_result = retry_if(
-            || {
-                remote.fetch(
-                    &[format!("+{}:{}", target_id, target_id)],
-                    Some(&mut ssh_agent_fetch_options()),
-                    None,
-                )
-            },
-            |error| {
-                matches!(error.class(), git2::ErrorClass::Ssh)
-                    && !matches!(error.code(), git2::ErrorCode::Auth)
-            },
-            None,
-            Some(std::time::Duration::from_millis(100)),
-        );
+            // optimistically fetches only requested commit
+            let fetch_result = retry_if(
+                || {
+                    remote.fetch(
+                        &[format!("+{}:{}", target_id, target_id)],
+                        Some(&mut ssh_agent_fetch_options()),
+                        None,
+                    )
+                },
+                |error| {
+                    matches!(error.class(), git2::ErrorClass::Ssh)
+                        && !matches!(error.code(), git2::ErrorCode::Auth)
+                },
+                None,
+                Some(std::time::Duration::from_millis(100)),
+            );
 
-        // some servers don't allow fetching one commit; in that case fetch everything
-        let fetch_result = if let Err(error) = &fetch_result {
-            if matches!(error.class(), git2::ErrorClass::Odb)
-                && matches!(error.code(), git2::ErrorCode::NotFound)
-            {
-                retry_if(
-                    || remote.fetch::<&str>(&[], Some(&mut ssh_agent_fetch_options()), None),
-                    |error| {
-                        matches!(error.class(), git2::ErrorClass::Ssh)
-                            && !matches!(error.code(), git2::ErrorCode::Auth)
-                    },
-                    None,
-                    Some(std::time::Duration::from_millis(100)),
-                )
+            // some servers don't allow fetching one commit; in that case fetch everything
+            let fetch_result = if let Err(error) = &fetch_result {
+                if matches!(error.class(), git2::ErrorClass::Odb)
+                    && matches!(error.code(), git2::ErrorCode::NotFound)
+                {
+                    retry_if(
+                        || remote.fetch::<&str>(&[], Some(&mut ssh_agent_fetch_options()), None),
+                        |error| {
+                            matches!(error.class(), git2::ErrorClass::Ssh)
+                                && !matches!(error.code(), git2::ErrorCode::Auth)
+                        },
+                        None,
+                        Some(std::time::Duration::from_millis(100)),
+                    )
+                } else {
+                    fetch_result
+                }
             } else {
                 fetch_result
+            };
+
+            // if both fetches failed, then exit
+            fetch_result.context("Could not fetch submodule")?;
+
+            submodule
+                .find_commit(target_id)
+                .context("Could not find commit in submodule")?
+        }
+    };
+
+    // Check the edge case of files that are currently untracked, but were in the commit we're targeting.
+    // We don't want these files to be accidentally overwritten by the checkout
+    if !force_checkout {
+        let commit_tree = commit.tree().context("Could not get commit's tree")?;
+
+        for path in &untracked_files {
+            if commit_tree.get_name(path).is_some() {
+                bail!(format!(
+                    "'{}/{path}' would be overwritten by checkout",
+                    submodule_path.display()
+                ))
             }
-        } else {
-            fetch_result
-        };
-
-        // if both fetches failed, then exit
-        fetch_result.context("Could not fetch submodule")?;
-
-        submodule
-            .set_head_detached(target_id)
-            .context("Could not set head in submodule")?;
+        }
     }
+
+    submodule
+        .set_head_detached(target_id)
+        .context("Could not set head in submodule")?;
 
     tracing::info!("Updated HEAD from {:?} to {}", workdir_id, target_id);
 

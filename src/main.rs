@@ -101,6 +101,7 @@ async fn async_main() -> anyhow::Result<()> {
         })?;
     let (error_sender, error_receiver) = mpsc::unbounded_channel();
     handle_repository(
+        root_repository.clone(),
         root_repository,
         args.bump,
         args.ignore,
@@ -235,6 +236,7 @@ impl<T> UnwrapOrResumeUnwind for Result<T, tokio::task::JoinError> {
 }
 
 fn handle_repository(
+    root_path: PathBuf,
     path: PathBuf,
     bumped_categories: Vec<String>,
     ignored_categories: Vec<String>,
@@ -257,6 +259,7 @@ fn handle_repository(
                     operation = Operation::Bump;
                 }
             }
+            let cloned_root_path = root_path.clone();
             let cloned_path = path.clone();
             let recursive = submodule.recursive.unwrap_or(false);
             let cloned_submodule_path = submodule_path.clone();
@@ -304,7 +307,8 @@ fn handle_repository(
                     match config {
                         Ok(Some(config)) => {
                             if let Err(error) = handle_repository(
-                                submodule_path,
+                                cloned_root_path.clone(),
+                                submodule_path.clone(),
                                 cloned_bumped_categories,
                                 cloned_ignored_categories,
                                 cloned_error_sender.clone(),
@@ -315,7 +319,10 @@ fn handle_repository(
                             {
                                 tracing::error!(?error, "Error while checkouting submodule");
                                 // ignore unexpectedly dropped receiver
-                                let _ = cloned_error_sender.send(Err(error));
+                                let _ = cloned_error_sender.send(Err(error.context(format!(
+                                    "Error while checkouting {}",
+                                    submodule_path.display()
+                                ))));
                             }
                         }
                         Ok(None) => {}
@@ -326,7 +333,16 @@ fn handle_repository(
                     }
                 }
                 // ignore unexpectedly dropped receiver
-                let _ = cloned_error_sender.send(checkout_result);
+                let _ = cloned_error_sender.send(checkout_result.with_context(|| {
+                    format!(
+                        "Error while checkouting {}",
+                        cloned_path
+                            .join(&submodule_path)
+                            .strip_prefix(cloned_root_path)
+                            .unwrap_or(&cloned_path)
+                            .display(),
+                    )
+                }));
             }));
         }
 
@@ -685,10 +701,7 @@ fn checkout_repo(
 
         for path in &untracked_files {
             if commit_tree.get_name(path).is_some() {
-                bail!(format!(
-                    "'{}/{path}' would be overwritten by checkout",
-                    submodule_path.display()
-                ))
+                bail!(format!("'{path}' would be overwritten by checkout"))
             }
         }
     }

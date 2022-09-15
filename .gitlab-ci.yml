@@ -34,4 +34,5 @@ build:
     paths:
       - target/release/checkout
       - target/x86_64-pc-windows-gnu/release/checkout.exe
+  needs: []
 

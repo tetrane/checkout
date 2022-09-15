@@ -76,6 +76,10 @@ fn main() -> anyhow::Result<()> {
 async fn async_main() -> anyhow::Result<()> {
     let tracer = tracing_subscriber::FmtSubscriber::builder()
         .with_max_level(tracing::Level::INFO)
+        .with_target(false)
+        .without_time()
+        .with_line_number(false)
+        .with_file(false)
         .finish();
     tracing::subscriber::set_global_default(tracer)?;
     let mut args = Args::parse();
@@ -701,7 +705,11 @@ fn checkout_repo(
     index.read_tree(&head_tree)?;
     index.write()?;
 
-    tracing::info!("Updated HEAD from {:?} to {}", workdir_id, target_id);
+    if let Some(workdir_id) = workdir_id {
+        tracing::info!("{} -> {}", workdir_id, target_id);
+    } else {
+        tracing::info!("initialized at {}", target_id);
+    }
 
     checkout_head(&submodule)?;
 

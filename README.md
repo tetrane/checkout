@@ -7,7 +7,8 @@ Tool to recursively update submodules in no-brain mode.
 
 Each commit to the master branch produces new binaries:
 
-- [Linux](../-/jobs/artifacts/master/file/target/release/checkout?job=build)
+- [Linux (`glibc`, dynamic binary)](../-/jobs/artifacts/master/file/target/release/checkout?job=build)
+- [Linux (`musl`, static binary)](../-/jobs/artifacts/master/file/target/x86_64-unknown-linux-musl/release/checkout?job=build)
 - [Windows](../-/jobs/artifacts/master/file/target/x86_64-pc-windows-gnu/release/checkout.exe?job=build)
 
 # Adding to CI
@@ -19,7 +20,7 @@ Each commit to the master branch produces new binaries:
 - export CURL_CA_BUNDLE="$CI_SERVER_TLS_CA_FILE"
 - |
          curl --location --output /usr/local/bin/checkout \
-              "${CI_API_V4_URL}/projects/tetrane-public%2Ftools%2Fcheckout/jobs/artifacts/master/raw/target/release/checkout?job=build"
+              "${CI_API_V4_URL}/projects/tetrane-public%2Ftools%2Fcheckout/jobs/artifacts/master/raw/checkout?job=build"
 - chmod +x /usr/local/bin/checkout
 - checkout
 ```
@@ -28,7 +29,7 @@ Each commit to the master branch produces new binaries:
 
 ```yml
 - wget -OutFile checkout.exe
-             "${CI_API_V4_URL}/projects/tetrane-public%2Ftools%2Fcheckout/jobs/artifacts/master/raw/target/x86_64-pc-windows-gnu/release/checkout.exe?job=build"
+             "${CI_API_V4_URL}/projects/tetrane-public%2Ftools%2Fcheckout/jobs/artifacts/master/raw/checkout.exe?job=build"
 - checkout.exe
 ```
 

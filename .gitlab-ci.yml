@@ -26,12 +26,20 @@ clippy:
 build:
   stage: build
   script:
-    - apt update && apt install -y gcc-mingw-w64-x86-64
+    - apt update && apt install -y gcc-mingw-w64-x86-64 musl-tools
     - rustup target add x86_64-pc-windows-gnu
+    - rustup target add x86_64-unknown-linux-musl
     - RUSTFLAGS="-D warnings" cargo build --release
+    - RUSTFLAGS="-D warnings" cargo build --release --target x86_64-unknown-linux-musl
     - RUSTFLAGS="-D warnings" cargo build --release --target x86_64-pc-windows-gnu
+    - cp target/x86_64-unknown-linux-musl/release/checkout .
+    - cp target/x86_64-pc-windows-gnu/release/checkout.exe .
   artifacts:
     paths:
       - target/release/checkout
+      - target/x86_64-unknown-linux-musl/release/checkout
       - target/x86_64-pc-windows-gnu/release/checkout.exe
+      - checkout
+      - checkout.exe
+  needs: []
 

@@ -464,8 +464,9 @@ fn checkout_repo(
             let fetch_result = retry_if(
                 || submodule.update(true, Some(&mut options)),
                 |error| {
-                    matches!(error.class(), git2::ErrorClass::Ssh)
-                        && !matches!(error.code(), git2::ErrorCode::Auth)
+                    matches!(error.class(), git2::ErrorClass::Net)
+                        || (matches!(error.class(), git2::ErrorClass::Ssh)
+                            && !matches!(error.code(), git2::ErrorCode::Auth))
                 },
                 None,
                 Some(std::time::Duration::from_millis(100)),
@@ -508,8 +509,9 @@ fn checkout_repo(
             retry_if(
                 || remote.fetch(&[&branch], Some(&mut ssh_agent_fetch_options()), None),
                 |error| {
-                    matches!(error.class(), git2::ErrorClass::Ssh)
-                        && !matches!(error.code(), git2::ErrorCode::Auth)
+                    matches!(error.class(), git2::ErrorClass::Net)
+                        || (matches!(error.class(), git2::ErrorClass::Ssh)
+                            && !matches!(error.code(), git2::ErrorCode::Auth))
                 },
                 None,
                 Some(std::time::Duration::from_millis(100)),
@@ -562,8 +564,9 @@ fn checkout_repo(
                 )
             },
             |error| {
-                matches!(error.class(), git2::ErrorClass::Ssh)
-                    && !matches!(error.code(), git2::ErrorCode::Auth)
+                matches!(error.class(), git2::ErrorClass::Net)
+                    || (matches!(error.class(), git2::ErrorClass::Ssh)
+                        && !matches!(error.code(), git2::ErrorCode::Auth))
             },
             None,
             Some(std::time::Duration::from_millis(100)),
@@ -577,8 +580,9 @@ fn checkout_repo(
                 retry_if(
                     || remote.fetch::<&str>(&[], Some(&mut ssh_agent_fetch_options()), None),
                     |error| {
-                        matches!(error.class(), git2::ErrorClass::Ssh)
-                            && !matches!(error.code(), git2::ErrorCode::Auth)
+                        matches!(error.class(), git2::ErrorClass::Net)
+                            || (matches!(error.class(), git2::ErrorClass::Ssh)
+                                && !matches!(error.code(), git2::ErrorCode::Auth))
                     },
                     None,
                     Some(std::time::Duration::from_millis(100)),

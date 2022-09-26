@@ -34,12 +34,12 @@ struct Args {
     #[clap(value_parser)]
     repository_path: Option<String>,
 
-    /// If present, forces the checkout to occur even if there are modified files staged.
+    /// If present, forces the checkout to occur even if there are modified files (staged or not).
     ///
-    /// **This can lead to data losses.**
+    /// **Enabling this option can lead to data losses.**
     ///
     /// Environment variable: TETRANE_CHECKOUT_FORCE_CHECKOUT
-    #[clap(short, long, parse(from_flag))]
+    #[clap(long, parse(from_flag))]
     force_checkout: bool,
 }
 
@@ -76,6 +76,10 @@ fn main() -> anyhow::Result<()> {
 async fn async_main() -> anyhow::Result<()> {
     let tracer = tracing_subscriber::FmtSubscriber::builder()
         .with_max_level(tracing::Level::INFO)
+        .with_target(false)
+        .without_time()
+        .with_line_number(false)
+        .with_file(false)
         .finish();
     tracing::subscriber::set_global_default(tracer)?;
     let mut args = Args::parse();
@@ -97,6 +101,7 @@ async fn async_main() -> anyhow::Result<()> {
         })?;
     let (error_sender, error_receiver) = mpsc::unbounded_channel();
     handle_repository(
+        root_repository.clone(),
         root_repository,
         args.bump,
         args.ignore,
@@ -231,6 +236,7 @@ impl<T> UnwrapOrResumeUnwind for Result<T, tokio::task::JoinError> {
 }
 
 fn handle_repository(
+    root_path: PathBuf,
     path: PathBuf,
     bumped_categories: Vec<String>,
     ignored_categories: Vec<String>,
@@ -253,6 +259,7 @@ fn handle_repository(
                     operation = Operation::Bump;
                 }
             }
+            let cloned_root_path = root_path.clone();
             let cloned_path = path.clone();
             let recursive = submodule.recursive.unwrap_or(false);
             let cloned_submodule_path = submodule_path.clone();
@@ -300,7 +307,8 @@ fn handle_repository(
                     match config {
                         Ok(Some(config)) => {
                             if let Err(error) = handle_repository(
-                                submodule_path,
+                                cloned_root_path.clone(),
+                                submodule_path.clone(),
                                 cloned_bumped_categories,
                                 cloned_ignored_categories,
                                 cloned_error_sender.clone(),
@@ -311,7 +319,10 @@ fn handle_repository(
                             {
                                 tracing::error!(?error, "Error while checkouting submodule");
                                 // ignore unexpectedly dropped receiver
-                                let _ = cloned_error_sender.send(Err(error));
+                                let _ = cloned_error_sender.send(Err(error.context(format!(
+                                    "Error while checkouting {}",
+                                    submodule_path.display()
+                                ))));
                             }
                         }
                         Ok(None) => {}
@@ -322,7 +333,16 @@ fn handle_repository(
                     }
                 }
                 // ignore unexpectedly dropped receiver
-                let _ = cloned_error_sender.send(checkout_result);
+                let _ = cloned_error_sender.send(checkout_result.with_context(|| {
+                    format!(
+                        "Error while checkouting {}",
+                        cloned_path
+                            .join(&submodule_path)
+                            .strip_prefix(cloned_root_path)
+                            .unwrap_or(&cloned_path)
+                            .display(),
+                    )
+                }));
             }));
         }
 
@@ -495,6 +515,83 @@ fn checkout_repo(
         }
     };
 
+    let mut untracked_files = Vec::new();
+
+    // check submodule's current status, fail if there are modified or staged files
+    if !force_checkout {
+        if !matches!(submodule.state(), git2::RepositoryState::Clean) {
+            bail!("The submodule is not in a clean state (is a rebase in progress?")
+        }
+        let mut status_options = git2::StatusOptions::default();
+        status_options.include_untracked(true);
+        let statuses = submodule
+            .statuses(Some(&mut status_options))
+            .context("Could not access submodule status")?;
+        if !statuses.is_empty() {
+            let mut conflicts = 0;
+            let mut indexed = 0;
+            let mut modified = 0;
+            for entry in statuses.iter() {
+                let path = if let Some(path) = entry.path() {
+                    path
+                } else {
+                    continue;
+                };
+
+                // We need to handle submodules specially, because we don't want to lose their contents if modified,
+                // but at the same time we don't want to stop just because they are not at the right commit,
+                // since it is kind of the point to checkout them :-).
+                // This checks if the conflicting path is a submodule, and if so, it attempts to get its status.
+                // If the submodule is not in the index of this repository, we can safely ignore it:
+                // - the checkout operation ignores submodule.
+                // - the "dirtiness" of the submodule's worktree will be detected afterwards as long as it has a
+                //   Checkout.toml.
+                if let Ok(status) =
+                    submodule.submodule_status(path, git2::SubmoduleIgnore::Untracked)
+                {
+                    if !status.intersects(
+                        git2::SubmoduleStatus::INDEX_ADDED
+                            | git2::SubmoduleStatus::INDEX_DELETED
+                            | git2::SubmoduleStatus::INDEX_MODIFIED,
+                    ) {
+                        continue;
+                    }
+                }
+                if entry.status().is_conflicted() {
+                    conflicts += 1;
+                } else if entry.status().intersects(
+                    git2::Status::INDEX_DELETED
+                        | git2::Status::INDEX_MODIFIED
+                        | git2::Status::INDEX_NEW
+                        | git2::Status::INDEX_RENAMED
+                        | git2::Status::INDEX_TYPECHANGE,
+                ) {
+                    indexed += 1;
+                } else if entry.status().intersects(
+                    git2::Status::WT_DELETED
+                        | git2::Status::WT_MODIFIED
+                        | git2::Status::WT_RENAMED
+                        | git2::Status::WT_TYPECHANGE,
+                ) {
+                    modified += 1
+                } else if entry.status().is_wt_new() {
+                    untracked_files.push(path.to_string());
+                    continue;
+                } else {
+                };
+            }
+            if conflicts != 0 || indexed != 0 || modified != 0 {
+                bail!(format!(
+                    "Repository '{}' is not clean: {} conflicts, {} indexed, {} modified",
+                    submodule_path.display(),
+                    conflicts,
+                    indexed,
+                    modified,
+                ));
+            }
+        }
+    }
+
     // Determine target commit depending on operation
     let target_id = match operation {
         Operation::Checkout => head_id,
@@ -533,82 +630,112 @@ fn checkout_repo(
 
     if let Some(workdir_id) = workdir_id {
         if workdir_id == target_id {
-            tracing::info!("HEAD already at {}", target_id);
-            let mut cb = git2::build::CheckoutBuilder::new();
-            if force_checkout {
-                cb.force();
-            }
-            submodule
-                .checkout_head(Some(&mut cb))
-                .context("Could not checkout head")?;
+            tracing::trace!("HEAD already at {}", target_id);
+            checkout_head(&submodule)?;
 
             return Ok(CheckoutResult::Unchanged);
         }
     }
 
     // optimistically attempt to set the commit
-    if submodule.set_head_detached(target_id).is_err() {
-        let mut remote = submodule
-            .find_remote("origin")
-            .context("Could not find submodule remote")?;
+    let commit = match submodule.find_commit(target_id) {
+        Ok(commit) => commit,
+        Err(_) => {
+            let mut remote = submodule
+                .find_remote("origin")
+                .context("Could not find submodule remote")?;
 
-        // optimistically fetches only requested commit
-        let fetch_result = retry_if(
-            || {
-                remote.fetch(
-                    &[format!("+{}:{}", target_id, target_id)],
-                    Some(&mut ssh_agent_fetch_options()),
-                    None,
-                )
-            },
-            |error| {
-                matches!(error.class(), git2::ErrorClass::Ssh)
-                    && !matches!(error.code(), git2::ErrorCode::Auth)
-            },
-            None,
-            Some(std::time::Duration::from_millis(100)),
-        );
+            // optimistically fetches only requested commit
+            let fetch_result = retry_if(
+                || {
+                    remote.fetch(
+                        &[format!("+{}:{}", target_id, target_id)],
+                        Some(&mut ssh_agent_fetch_options()),
+                        None,
+                    )
+                },
+                |error| {
+                    matches!(error.class(), git2::ErrorClass::Ssh)
+                        && !matches!(error.code(), git2::ErrorCode::Auth)
+                },
+                None,
+                Some(std::time::Duration::from_millis(100)),
+            );
 
-        // some servers don't allow fetching one commit; in that case fetch everything
-        let fetch_result = if let Err(error) = &fetch_result {
-            if matches!(error.class(), git2::ErrorClass::Odb)
-                && matches!(error.code(), git2::ErrorCode::NotFound)
-            {
-                retry_if(
-                    || remote.fetch::<&str>(&[], Some(&mut ssh_agent_fetch_options()), None),
-                    |error| {
-                        matches!(error.class(), git2::ErrorClass::Ssh)
-                            && !matches!(error.code(), git2::ErrorCode::Auth)
-                    },
-                    None,
-                    Some(std::time::Duration::from_millis(100)),
-                )
+            // some servers don't allow fetching one commit; in that case fetch everything
+            let fetch_result = if let Err(error) = &fetch_result {
+                if matches!(error.class(), git2::ErrorClass::Odb)
+                    && matches!(error.code(), git2::ErrorCode::NotFound)
+                {
+                    retry_if(
+                        || remote.fetch::<&str>(&[], Some(&mut ssh_agent_fetch_options()), None),
+                        |error| {
+                            matches!(error.class(), git2::ErrorClass::Ssh)
+                                && !matches!(error.code(), git2::ErrorCode::Auth)
+                        },
+                        None,
+                        Some(std::time::Duration::from_millis(100)),
+                    )
+                } else {
+                    fetch_result
+                }
             } else {
                 fetch_result
+            };
+
+            // if both fetches failed, then exit
+            fetch_result.context("Could not fetch submodule")?;
+
+            submodule
+                .find_commit(target_id)
+                .context("Could not find commit in submodule")?
+        }
+    };
+
+    // Check the edge case of files that are currently untracked, but were in the commit we're targeting.
+    // We don't want these files to be accidentally overwritten by the checkout
+    if !force_checkout {
+        let commit_tree = commit.tree().context("Could not get commit's tree")?;
+
+        for path in &untracked_files {
+            if commit_tree.get_name(path).is_some() {
+                bail!(format!("'{path}' would be overwritten by checkout"))
             }
-        } else {
-            fetch_result
-        };
-
-        // if both fetches failed, then exit
-        fetch_result.context("Could not fetch submodule")?;
-
-        submodule
-            .set_head_detached(target_id)
-            .context("Could not set head in submodule")?;
+        }
     }
 
-    tracing::info!("Updated HEAD from {:?} to {}", workdir_id, target_id);
-
-    let mut cb = git2::build::CheckoutBuilder::new();
-    if force_checkout {
-        cb.force();
-    }
     submodule
+        .set_head_detached(target_id)
+        .context("Could not set head in submodule")?;
+
+    // set_head_detached tend to index stuff, clear everything (nothing was indexed before as per the status check)
+    let mut index = submodule
+        .index()
+        .context("Could not get submodule's index file")?;
+    let head_tree = submodule.head()?.peel_to_tree()?;
+    index.read_tree(&head_tree)?;
+    index.write()?;
+
+    if let Some(workdir_id) = workdir_id {
+        tracing::info!("{} -> {}", workdir_id, target_id);
+    } else {
+        tracing::info!("initialized at {}", target_id);
+    }
+
+    checkout_head(&submodule)?;
+
+    Ok(CheckoutResult::Changed)
+}
+
+fn checkout_head(repository: &git2::Repository) -> anyhow::Result<()> {
+    let mut cb = git2::build::CheckoutBuilder::new();
+    cb.force();
+
+    repository
         .checkout_head(Some(&mut cb))
         .context("Could not checkout head")?;
 
-    Ok(CheckoutResult::Changed)
+    Ok(())
 }
 
 fn ssh_agent_fetch_options() -> git2::FetchOptions<'static> {

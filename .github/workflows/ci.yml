@@ -1,0 +1,56 @@
+name: Build
+
+on: [push]
+
+jobs:
+  clippy:
+    runs-on: ubuntu-latest
+    container:
+      image: rust:1.61-buster
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+      - name: Install toolchains
+        run: |
+          rustup component add rustfmt --toolchain 1.61.0-x86_64-unknown-linux-gnu
+          rustup component add clippy --toolchain 1.61.0-x86_64-unknown-linux-gnu
+          cargo fmt -- --check
+          RUSTFLAGS="-D warnings" cargo clippy
+          RUSTFLAGS="-D warnings" cargo test -- --nocapture
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: rust:1.61-buster
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+      - name: Install toolchains
+        run: |
+          apt update && apt install -y gcc-mingw-w64-x86-64 musl-tools
+          rustup target add x86_64-pc-windows-gnu
+          rustup target add x86_64-unknown-linux-musl
+      - name: Build binaries
+        run: |
+          RUSTFLAGS="-D warnings" cargo build --release
+          RUSTFLAGS="-D warnings" cargo build --release --target x86_64-unknown-linux-musl
+          RUSTFLAGS="-D warnings" cargo build --release --target x86_64-pc-windows-gnu
+          cp target/release/checkout .
+          cp target/x86_64-unknown-linux-musl/release/checkout checkout-static
+          cp target/x86_64-pc-windows-gnu/release/checkout.exe .
+      - name: Upload production artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: Binaries
+          path: |
+            target/release/checkout
+            target/x86_64-unknown-linux-musl/release/checkout
+            target/x86_64-pc-windows-gnu/release/checkout.exe
+            checkout
+            checkout-static
+            checkout.exe
+      - name: Release production artifacts
+        uses: ncipollo/release-action@v1
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          artifacts: "checkout,checkout-static,checkout.exe"
+          token: ${{ secrets.GITHUB_TOKEN }}

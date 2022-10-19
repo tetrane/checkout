@@ -359,6 +359,22 @@ enum Operation {
     Checkout,
 }
 
+fn retry_if_net<T, F>(try_this: F) -> Result<T, git2::Error>
+where
+    F: FnMut() -> Result<T, git2::Error>,
+{
+    retry_if(
+        try_this,
+        |error| {
+            matches!(error.class(), git2::ErrorClass::Net)
+                || (matches!(error.class(), git2::ErrorClass::Ssh)
+                    && !matches!(error.code(), git2::ErrorCode::Auth))
+        },
+        Some(10),
+        Some(std::time::Duration::from_secs(1)),
+    )
+}
+
 fn retry_if_locked<T, F>(try_this: F) -> Result<T, git2::Error>
 where
     F: FnMut() -> Result<T, git2::Error>,
@@ -481,15 +497,7 @@ fn checkout_repo(
             let mut options = git2::SubmoduleUpdateOptions::new();
             options.fetch(ssh_agent_fetch_options());
             options.allow_fetch(false);
-            let fetch_result = retry_if(
-                || submodule.update(true, Some(&mut options)),
-                |error| {
-                    matches!(error.class(), git2::ErrorClass::Ssh)
-                        && !matches!(error.code(), git2::ErrorCode::Auth)
-                },
-                None,
-                Some(std::time::Duration::from_millis(100)),
-            );
+            let fetch_result = retry_if_net(|| submodule.update(true, Some(&mut options)));
 
             let fetch_result = if let Err(error) = &fetch_result {
                 // ignore if the update failed due to missing commit: we'll try fetching it again later
@@ -602,16 +610,8 @@ fn checkout_repo(
                 .find_remote("origin")
                 .context("Could not find submodule remote")?;
 
-            retry_if(
-                || remote.fetch(&[&branch], Some(&mut ssh_agent_fetch_options()), None),
-                |error| {
-                    matches!(error.class(), git2::ErrorClass::Ssh)
-                        && !matches!(error.code(), git2::ErrorCode::Auth)
-                },
-                None,
-                Some(std::time::Duration::from_millis(100)),
-            )
-            .context("Could not fetch remote branch")?;
+            retry_if_net(|| remote.fetch(&[&branch], Some(&mut ssh_agent_fetch_options()), None))
+                .context("Could not fetch remote branch")?;
             let branch = format!("refs/remotes/origin/{}", branch);
 
             let reference = submodule.find_reference(&branch).context(format!(
@@ -646,36 +646,22 @@ fn checkout_repo(
                 .context("Could not find submodule remote")?;
 
             // optimistically fetches only requested commit
-            let fetch_result = retry_if(
-                || {
-                    remote.fetch(
-                        &[format!("+{}:{}", target_id, target_id)],
-                        Some(&mut ssh_agent_fetch_options()),
-                        None,
-                    )
-                },
-                |error| {
-                    matches!(error.class(), git2::ErrorClass::Ssh)
-                        && !matches!(error.code(), git2::ErrorCode::Auth)
-                },
-                None,
-                Some(std::time::Duration::from_millis(100)),
-            );
+            let fetch_result = retry_if_net(|| {
+                remote.fetch(
+                    &[format!("+{}:{}", target_id, target_id)],
+                    Some(&mut ssh_agent_fetch_options()),
+                    None,
+                )
+            });
 
             // some servers don't allow fetching one commit; in that case fetch everything
             let fetch_result = if let Err(error) = &fetch_result {
                 if matches!(error.class(), git2::ErrorClass::Odb)
                     && matches!(error.code(), git2::ErrorCode::NotFound)
                 {
-                    retry_if(
-                        || remote.fetch::<&str>(&[], Some(&mut ssh_agent_fetch_options()), None),
-                        |error| {
-                            matches!(error.class(), git2::ErrorClass::Ssh)
-                                && !matches!(error.code(), git2::ErrorCode::Auth)
-                        },
-                        None,
-                        Some(std::time::Duration::from_millis(100)),
-                    )
+                    retry_if_net(|| {
+                        remote.fetch::<&str>(&[], Some(&mut ssh_agent_fetch_options()), None)
+                    })
                 } else {
                     fetch_result
                 }

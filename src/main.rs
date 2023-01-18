@@ -479,47 +479,19 @@ fn checkout_repo(
     let submodule = match submodule.open() {
         Ok(submodule) => submodule,
         Err(_) => {
-            // git init the submodule in .git/modules/<submodule_path> of the parent repository
-            let mut init_opts = git2::RepositoryInitOptions::new();
-            init_opts.no_reinit(false).no_dotgit_dir(true);
-            let workdir = repository
-                .workdir()
-                .context("Could not get parent workdir")?;
-            init_opts.workdir_path(&workdir.join(&submodule_path));
-            let gitdir = repository
-                .path()
-                .join(Path::new("modules"))
-                .join(&submodule_path);
-            std::fs::create_dir_all(&gitdir).context("Could not create submodule path")?; // RepositoryInitOptions.mkpath() doesn't seem to work, let's help it
-            git2::Repository::init_opts(gitdir, &init_opts).context("Could not init submodule")?;
+            // Init submodule
+            submodule
+                .repo_init(true)
+                .context("Could not initialize submodule repository")?;
 
-            // update the submodule
+            // Then clone it
             let mut options = git2::SubmoduleUpdateOptions::new();
             options.fetch(ssh_agent_fetch_options());
             options.allow_fetch(false);
-            let fetch_result = retry_if_net(|| submodule.update(true, Some(&mut options)));
 
-            let fetch_result = if let Err(error) = &fetch_result {
-                // ignore if the update failed due to missing commit: we'll try fetching it again later
-                if matches!(error.class(), git2::ErrorClass::Odb)
-                    && matches!(error.code(), git2::ErrorCode::NotFound)
-                {
-                    Ok(())
-                } else {
-                    fetch_result
-                }
-            } else {
-                fetch_result
-            };
-
-            fetch_result.context("Could not update submodule")?;
-
-            // Set the origin remote
-            retry_if_locked(|| submodule.sync())
-                .context("Could not sync submodule")
-                .unwrap();
-
-            submodule.open().context("Could not open submodule")?
+            submodule
+                .clone(Some(&mut options))
+                .context("Could not clone submodule")?
         }
     };
 
@@ -738,7 +710,7 @@ fn ssh_agent_fetch_options() -> git2::FetchOptions<'static> {
     });
     cbs.certificate_check(|_cert, _s| {
         tracing::warn!(%_s, "Ignoring certificate");
-        true
+        Ok(git2::CertificateCheckStatus::CertificateOk)
     });
     let mut fetch_opts = git2::FetchOptions::new();
     fetch_opts.remote_callbacks(cbs);

@@ -8,7 +8,9 @@ edition = "2021"
 [dependencies]
 anyhow = "1.0.58"
 clap = { version = "3.2.6", features = ["derive"] }
-git2 = { version = "0.14.4", features = ["vendored-libgit2", "vendored-openssl"] }
+# git2 = { version = "0.14.4", features = ["vendored-libgit2", "vendored-openssl"] }
+# TODO reset this to something like the line above when https://github.com/rust-lang/git2-rs/pull/914 will be merged
+git2 = { git = "https://github.com/Hyask/git2-rs", branch = "master", features = ["vendored-libgit2", "vendored-openssl"] }
 owo-colors = "3.4.0"
 serde = { version = "1.0.137", features = ["derive"] }
 tokio = { version = "1.19.2", features = ["rt-multi-thread", "process", "macros", "sync", "time"] }

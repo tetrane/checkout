@@ -127,8 +127,8 @@ dependencies = [
 
 [[package]]
 name = "git2"
-version = "0.16.0"
-source = "git+https://github.com/Hyask/git2-rs?branch=master#f587915c99faaeb93d2e5e6e417ad6d6b6792466"
+version = "0.16.1"
+source = "git+https://github.com/rust-lang/git2-rs?branch=master#c5765efabe7dfe5758f875d136ecbf77133d3c95"
 dependencies = [
  "bitflags",
  "libc",
@@ -204,8 +204,8 @@ checksum = "349d5a591cd28b49e1d1037471617a32ddcda5731b99419008085f72d5a53836"
 
 [[package]]
 name = "libgit2-sys"
-version = "0.14.1+1.5.0"
-source = "git+https://github.com/Hyask/git2-rs?branch=master#f587915c99faaeb93d2e5e6e417ad6d6b6792466"
+version = "0.14.2+1.5.1"
+source = "git+https://github.com/rust-lang/git2-rs?branch=master#c5765efabe7dfe5758f875d136ecbf77133d3c95"
 dependencies = [
  "cc",
  "libc",

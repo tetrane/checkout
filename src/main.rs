@@ -491,7 +491,31 @@ fn checkout_repo(
 
             submodule
                 .clone(Some(&mut options))
-                .context("Could not clone submodule")?
+                .context("Could not clone submodule")?;
+
+            let fetch_result = retry_if_net(|| submodule.update(true, Some(&mut options)));
+
+            let fetch_result = if let Err(error) = &fetch_result {
+                // ignore if the update failed due to missing commit: we'll try fetching it again later
+                if matches!(error.class(), git2::ErrorClass::Odb)
+                    && matches!(error.code(), git2::ErrorCode::NotFound)
+                {
+                    Ok(())
+                } else {
+                    fetch_result
+                }
+            } else {
+                fetch_result
+            };
+
+            fetch_result.context("Could not update submodule")?;
+
+            // Set the origin remote
+            retry_if_locked(|| submodule.sync())
+                .context("Could not sync submodule")
+                .unwrap();
+
+            submodule.open().context("Could not open submodule")?
         }
     };
 

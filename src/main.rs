@@ -272,13 +272,22 @@ fn handle_repository(
                     let cloned_submodule_path = cloned_submodule_path.clone();
 
                     tokio::task::spawn_blocking(move || {
-                        checkout_repo(
-                            cloned_path,
-                            cloned_submodule_path,
-                            operation,
-                            force_checkout,
-                            submodule.name,
-                        )
+                        let cloned_path = cloned_path.clone();
+                        let cloned_submodule_path = cloned_submodule_path.clone();
+
+                        retry(|| {
+                            let cloned_path = cloned_path.clone();
+                            let cloned_submodule_path = cloned_submodule_path.clone();
+                            let submodule_name = submodule.name.clone();
+
+                            checkout_repo(
+                                cloned_path,
+                                cloned_submodule_path,
+                                operation,
+                                force_checkout,
+                                submodule_name,
+                            )
+                        })
                     })
                     .await
                     .unwrap_or_resume_unwind()
@@ -292,17 +301,19 @@ fn handle_repository(
                     );
                 } else {
                     let submodule_path = cloned_path.join(cloned_submodule_path);
-                    let config = if recursive {
-                        (|| {
+                    let config = retry(|| {
+                        if recursive {
+                            let submodule_categories = submodule.categories.clone();
+
                             let repository = git2::Repository::open(&submodule_path)
                                 .context("Could not open submodule")?;
-                            Config::from_repository(repository, submodule.categories)
+                            Config::from_repository(repository, submodule_categories)
                                 .context("Could not load config")
                                 .map(Some)
-                        })()
-                    } else {
-                        Config::load(&submodule_path).context("Error reading configuration")
-                    };
+                        } else {
+                            Config::load(&submodule_path).context("Error reading configuration")
+                        }
+                    });
 
                     match config {
                         Ok(Some(config)) => {
@@ -357,6 +368,18 @@ fn handle_repository(
 enum Operation {
     Bump,
     Checkout,
+}
+
+fn retry<T, E, F>(try_this: F) -> Result<T, E>
+where
+    F: FnMut() -> Result<T, E>,
+{
+    retry_if(
+        try_this,
+        |_| true,
+        Some(3),
+        Some(std::time::Duration::from_millis(1000)),
+    )
 }
 
 fn retry_if_net<T, F>(try_this: F) -> Result<T, git2::Error>

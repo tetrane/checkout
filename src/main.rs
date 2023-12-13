@@ -405,8 +405,8 @@ where
     retry_if(
         try_this,
         |error| matches!(error.code(), git2::ErrorCode::Locked),
-        None,
-        Some(std::time::Duration::from_millis(100)),
+        Some(3),
+        Some(std::time::Duration::from_millis(1000)),
     )
 }
 

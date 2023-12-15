@@ -41,6 +41,10 @@ struct Args {
     /// Environment variable: TETRANE_CHECKOUT_FORCE_CHECKOUT
     #[clap(long, parse(from_flag))]
     force_checkout: bool,
+
+    /// If present, display debug messages
+    #[clap(long, parse(from_flag))]
+    debug: bool,
 }
 
 impl Args {
@@ -74,16 +78,22 @@ fn main() -> anyhow::Result<()> {
 }
 
 async fn async_main() -> anyhow::Result<()> {
+    let mut args = Args::parse();
+    args.merge_from_env();
+
     let tracer = tracing_subscriber::FmtSubscriber::builder()
-        .with_max_level(tracing::Level::INFO)
+        .with_max_level(if args.debug {
+            tracing::Level::DEBUG
+        } else {
+            tracing::Level::INFO
+        })
         .with_target(false)
         .without_time()
         .with_line_number(false)
         .with_file(false)
         .finish();
     tracing::subscriber::set_global_default(tracer)?;
-    let mut args = Args::parse();
-    args.merge_from_env();
+
     let root_repository = PathBuf::from(args.repository_path.unwrap_or_else(|| ".".into()));
     let root_repository = root_repository
         .canonicalize()

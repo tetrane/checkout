@@ -5,6 +5,7 @@ use std::{
 
 use anyhow::{bail, Context};
 use clap::Parser;
+use rand::Rng;
 use serde::Deserialize;
 use tokio::sync::mpsc;
 
@@ -380,13 +381,17 @@ where
 {
     retry_if(
         try_this,
+        // Some net errors are just class "Os"
+        // e.g "failed to get server certificate", "failed to send request", etc
         |error| {
             matches!(error.class(), git2::ErrorClass::Net)
                 || (matches!(error.class(), git2::ErrorClass::Ssh)
                     && !matches!(error.code(), git2::ErrorCode::Auth))
+                || matches!(error.class(), git2::ErrorClass::Os)
         },
-        Some(10),
-        Some(std::time::Duration::from_secs(1)),
+        10,
+        std::time::Duration::from_millis(100),
+        std::time::Duration::from_secs(5),
     )
 }
 
@@ -396,51 +401,48 @@ where
 {
     retry_if(
         try_this,
-        |error| matches!(error.code(), git2::ErrorCode::Locked),
-        Some(3),
-        Some(std::time::Duration::from_millis(1000)),
+        // Some lock errors are just class "Os"
+        // e.g "failed to rename lockfile"
+        |error| {
+            matches!(error.code(), git2::ErrorCode::Locked)
+                || matches!(error.class(), git2::ErrorClass::Os)
+        },
+        3,
+        std::time::Duration::from_millis(100),
+        std::time::Duration::from_secs(5),
     )
 }
 
 fn retry_if<T, E, F, G>(
     mut try_this: F,
     mut continue_on: G,
-    retry_counts: Option<usize>,
-    try_interval: Option<std::time::Duration>,
+    retry_counts: usize,
+    base_try_interval: std::time::Duration,
+    max_try_interval: std::time::Duration,
 ) -> Result<T, E>
 where
     F: FnMut() -> Result<T, E>,
     G: FnMut(&E) -> bool,
+    E: std::fmt::Debug,
 {
-    match (try_this(), retry_counts) {
-        (Ok(t), _) => Ok(t),
-        (Err(error), None) => {
+    match try_this() {
+        Ok(t) => Ok(t),
+        Err(error) => {
             let mut error = error;
 
-            loop {
+            for retry_count in 0..retry_counts {
                 if !continue_on(&error) {
                     return Err(error);
                 } else {
-                    if let Some(try_interval) = try_interval {
-                        std::thread::sleep(try_interval)
-                    }
-                    match try_this() {
-                        Ok(t) => return Ok(t),
-                        Err(new_error) => error = new_error,
-                    }
-                }
-            }
-        }
-        (Err(error), Some(retry_counts)) => {
-            let mut error = error;
+                    // Add exponential jittering to the sleep time
+                    let mut rng = rand::thread_rng();
+                    let delay = 2u64.pow(retry_count as u32) * base_try_interval.as_millis() as u64;
+                    let delay = std::cmp::min(max_try_interval.as_millis() as u64, delay);
+                    let delay = rng.gen_range(0..delay);
 
-            for _ in 0..retry_counts {
-                if !continue_on(&error) {
-                    return Err(error);
-                } else {
-                    if let Some(try_interval) = try_interval {
-                        std::thread::sleep(try_interval)
-                    }
+                    tracing::debug!("Retrying after {delay}ms for the error: {error:?}");
+                    std::thread::sleep(std::time::Duration::from_millis(delay));
+
                     match try_this() {
                         Ok(t) => return Ok(t),
                         Err(new_error) => error = new_error,

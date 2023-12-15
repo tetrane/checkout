@@ -616,7 +616,6 @@ fn checkout_repo(
                 } else if entry.status().is_wt_new() {
                     untracked_files.push(path.to_string());
                     continue;
-                } else {
                 };
             }
             if conflicts != 0 || indexed != 0 || modified != 0 {

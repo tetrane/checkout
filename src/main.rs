@@ -497,16 +497,36 @@ fn checkout_repo(
             // Init submodule
             submodule
                 .repo_init(true)
-                .context("Could not initialize submodule repository")?;
+                .context("Could not initialize submodule")?;
 
-            // Then clone it
+            // Read .git file so that we can restore it later if needed
+            let git_file = path.join(&submodule_path).join(".git");
+            let git_file_content =
+                std::fs::read_to_string(&git_file).context("Not able to read .git file")?;
+
+            // Then clone the submodule
             let mut options = git2::SubmoduleUpdateOptions::new();
             options.fetch(ssh_agent_fetch_options());
             options.allow_fetch(false);
 
-            submodule
-                .clone(Some(&mut options))
-                .context("Could not clone submodule")?;
+            let clone_result = submodule.clone(Some(&mut options));
+
+            if let Err(error) = clone_result {
+                if matches!(error.class(), git2::ErrorClass::Os) {
+                    // If the server isn't answering correctly, the .git file will disappear and leave us in a
+                    // non recoverable state, a workaround is to restore the .git manually before updating
+                    if !git_file.exists() {
+                        tracing::debug!("Re-creating .git file");
+                        std::fs::write(&git_file, git_file_content)
+                            .context("Unable to write .git file")?;
+                    }
+
+                    // Do not re-do the clone as this will fail if the clone was partially done
+                    // The update & fetch should detect any issue and will handle it correctly
+                } else {
+                    Err(error).context("Could not clone submodule")?;
+                }
+            }
 
             let fetch_result = retry_if_net(|| submodule.update(true, Some(&mut options)));
 

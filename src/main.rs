@@ -390,8 +390,8 @@ where
                 || matches!(error.class(), git2::ErrorClass::Os)
         },
         10,
-        std::time::Duration::from_millis(100),
-        std::time::Duration::from_secs(5),
+        std::time::Duration::from_millis(500),
+        std::time::Duration::from_secs(10),
     )
 }
 
@@ -407,9 +407,9 @@ where
             matches!(error.code(), git2::ErrorCode::Locked)
                 || matches!(error.class(), git2::ErrorClass::Os)
         },
-        3,
-        std::time::Duration::from_millis(100),
-        std::time::Duration::from_secs(5),
+        10,
+        std::time::Duration::from_millis(500),
+        std::time::Duration::from_secs(10),
     )
 }
 
